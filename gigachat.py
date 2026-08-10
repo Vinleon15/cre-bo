@@ -20,6 +20,10 @@ CHAT_URL = "https://gigachat.devices.sberbank.ru/api/v1/chat/completions"
 
 _token: str | None = None
 _token_expires: float = 0.0
+_last_call: float = 0.0
+
+# Сбер ограничивает частоту. Пауза между запросами к модели.
+MIN_INTERVAL = 1.2
 
 
 class GigaChatError(RuntimeError):
@@ -71,9 +75,18 @@ def _fetch_token() -> str:
     return _token
 
 
-def complete(system: str, user: str) -> str:
-    token = _fetch_token()
-    resp = requests.post(
+def _throttle() -> None:
+    """Не частим: между запросами выдерживаем паузу."""
+    global _last_call
+    wait = MIN_INTERVAL - (time.time() - _last_call)
+    if wait > 0:
+        time.sleep(wait)
+    _last_call = time.time()
+
+
+def _post(token: str, system: str, user: str):
+    _throttle()
+    return requests.post(
         CHAT_URL,
         headers={
             "Content-Type": "application/json",
@@ -90,28 +103,27 @@ def complete(system: str, user: str) -> str:
         timeout=60,
         verify=_verify(),
     )
+
+
+def complete(system: str, user: str) -> str:
+    token = _fetch_token()
+    resp = _post(token, system, user)
+
     if resp.status_code == 401:
         # токен протух раньше времени — сбрасываем и пробуем ещё раз
         global _token
         _token = None
-        token = _fetch_token()
-        resp = requests.post(
-            CHAT_URL,
-            headers={
-                "Content-Type": "application/json",
-                "Authorization": f"Bearer {token}",
-            },
-            json={
-                "model": config.GIGACHAT_MODEL,
-                "messages": [
-                    {"role": "system", "content": system},
-                    {"role": "user", "content": user},
-                ],
-                "temperature": 0.1,
-            },
-            timeout=60,
-            verify=_verify(),
-        )
+        resp = _post(_fetch_token(), system, user)
+
+    # 429 — превышена частота. Ждём и повторяем, с нарастающей паузой.
+    for attempt in range(3):
+        if resp.status_code != 429:
+            break
+        delay = float(resp.headers.get("Retry-After", 0)) or (3 * (attempt + 1))
+        log.warning("GigaChat просит подождать %.0f с", delay)
+        time.sleep(delay)
+        resp = _post(token, system, user)
+
     if resp.status_code != 200:
         raise GigaChatError(f"Ошибка модели ({resp.status_code}): {resp.text[:200]}")
 

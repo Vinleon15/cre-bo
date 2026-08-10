@@ -129,9 +129,15 @@ async def process_pending(limit: int = 60) -> tuple[int, str | None]:
             errors += 1
             db.mark_error(row["id"])
             log.warning("Разбор материала %s: %s", row["id"], e)
-            if errors >= 3:  # что-то системно не так — не мучаем сервис
-                return found, f"Остановлено после трёх ошибок. {last_error}"
-            await asyncio.sleep(1)
+            # Временные ограничения частоты не повод бросать всю пачку:
+            # gigachat.py уже подождал и повторил. Считаем только подряд идущие
+            # сбои и сдаёмся, если сервис отвечает ошибкой стабильно.
+            if "429" in last_error or "Too Many" in last_error:
+                await asyncio.sleep(5)
+                continue
+            if errors >= 5:
+                return found, f"Остановлено после пяти ошибок подряд. {last_error}"
+            await asyncio.sleep(2)
             continue
 
         if data is None:
@@ -139,6 +145,7 @@ async def process_pending(limit: int = 60) -> tuple[int, str | None]:
             continue
 
         db.save_extraction(row["id"], data)
+        errors = 0  # успех — счётчик подряд идущих сбоев обнуляем
         if data.get("relevant"):
             found += 1
 
