@@ -1,0 +1,8 @@
+aiogram>=3.7,<4
+aiohttp-socks>=0.9   # если прокси socks5
+requests[socks]>=2.31
+# anthropic>=0.40   # нужен только при MODE=ai
+requests>=2.31
+beautifulsoup4>=4.12
+lxml>=5.0
+python-dotenv>=1.0
