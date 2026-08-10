@@ -49,7 +49,9 @@ MODE_NAMES = {
 
 SOURCES = _list("SOURCES", "site")
 CRE_CATEGORIES = [int(x) for x in _list("CRE_CATEGORIES", "13") if x.isdigit()]
-TG_CHANNEL = os.getenv("TG_CHANNEL", "CRERussia").strip().lstrip("@")
+TG_CHANNELS = [
+    x.lstrip("@") for x in _list("TG_CHANNELS", os.getenv("TG_CHANNEL", "CRERussia"))
+]
 
 FETCH_FULL_TEXT = os.getenv("FETCH_FULL_TEXT", "1").strip() not in ("0", "false", "")
 REQUEST_DELAY = max(1.0, _float("REQUEST_DELAY", 1.5))
@@ -60,6 +62,12 @@ DB_PATH = os.getenv("DB_PATH", "data.sqlite3").strip()
 # Прокси для выхода в интернет. Пусто — идём напрямую.
 # Примеры: http://127.0.0.1:8080  |  socks5://127.0.0.1:1080
 PROXY_URL = os.getenv("PROXY_URL", "").strip()
+
+# Фоновый сбор: раз в столько минут. 0 — выключить.
+POLL_INTERVAL_MIN = _int("POLL_INTERVAL_MIN", 60)
+# Час, когда присылать сводку за сутки (по времени сервера). Пусто — не слать.
+_h = os.getenv("DAILY_DIGEST_HOUR", "").strip()
+DAILY_DIGEST_HOUR = int(_h) if _h.isdigit() else None
 
 USER_AGENT = "cre-digest-bot/1.0 (personal news digest; contact via Telegram)"
 

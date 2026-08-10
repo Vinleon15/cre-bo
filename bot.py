@@ -142,7 +142,7 @@ async def cmd_update(msg: types.Message):
     if not _allowed(msg.from_user.id):
         return
     note = await msg.answer("Забираю свежее…")
-    added = sources.collect_all()
+    added = await asyncio.to_thread(sources.collect_all)
     await note.edit_text(f"Загружено новых материалов: {added}. Разбираю…")
     parsed, error = await extractor.process_pending()
     mode = config.MODE_NAMES.get(extractor.current_mode(), "?")
