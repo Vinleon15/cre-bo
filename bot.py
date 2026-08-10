@@ -79,42 +79,65 @@ def format_deal(row) -> str:
     return "\n".join(lines)
 
 
-def build_digest(days: float, label: str, location: str | None = None) -> list[str]:
-    found = db.deals(days, location)
-    tail = db.rest(days) if not location else []
+def build_digest(
+    days: float,
+    label: str,
+    location: str | None = None,
+    show_rest: bool = False,
+) -> list[str]:
+    """Три блока: состоявшиеся сделки, сделки в процессе и (по запросу) прочее."""
+    done = db.deals(days, location)
+    pending = db.in_progress(days, location)
+    tail = db.rest(days) if show_rest else []
 
-    if not found and not tail:
-        return [f"За {label} ничего не найдено. Возможно, сбор ещё не запускался."]
+    if not done and not pending and not tail:
+        return [f"За {label} ничего не найдено."]
 
-    title = f"📊 <b>Дайджест за {label}</b> — сделок: {len(found)}"
+    title = f"📊 <b>Дайджест за {label}</b> — сделок: {len(done)}"
     if location:
         title += f"\nФильтр по локации: {esc(location)}"
 
     chunks, cur = [], title
-    for row in found:
-        block = "\n\n" + format_deal(row)
+
+    def add(block: str):
+        nonlocal cur
         if len(cur) + len(block) > 3800:
             chunks.append(cur)
             cur = block.strip()
         else:
             cur += block
 
+    for row in done:
+        add("\n\n" + format_deal(row))
+
+    if pending:
+        add(f"\n\n<b>В процессе ({len(pending)})</b>")
+        for row in pending:
+            stage = f" — {esc(row['stage'])}" if row["stage"] else ""
+            add(f'\n• <a href="{row["url"]}">{esc(row["title"])[:80]}</a>{stage}')
+
     if tail:
-        cur += f"\n\n<b>Остальное ({len(tail)})</b>"
+        add(f"\n\n<b>Остальное ({len(tail)})</b>")
         for row in tail:
-            line = f'\n• <a href="{row["url"]}">{esc(row["title"])[:90]}</a>'
-            if len(cur) + len(line) > 3800:
-                chunks.append(cur)
-                cur = line.strip()
-            else:
-                cur += line
+            add(f'\n• <a href="{row["url"]}">{esc(row["title"])[:90]}</a>')
+    elif not show_rest:
+        skipped = len(db.rest(days))
+        if skipped:
+            add(f"\n\n<i>Прочих материалов: {skipped}. Показать — /digest "
+                f"{days:g} все</i>")
 
     chunks.append(cur)
     return chunks
 
 
-async def send_digest(chat_id: int, days: float, label: str, location: str | None = None):
-    for chunk in build_digest(days, label, location):
+async def send_digest(
+    chat_id: int,
+    days: float,
+    label: str,
+    location: str | None = None,
+    show_rest: bool = False,
+):
+    for chunk in build_digest(days, label, location, show_rest):
         await bot.send_message(chat_id, chunk, disable_web_page_preview=True)
 
 
@@ -129,6 +152,7 @@ async def cmd_start(msg: types.Message):
         "/digest — сводка за сутки\n"
         "/digest 7 — за неделю\n"
         "/digest 3 Москва — за 3 дня с фильтром по локации\n"
+        "/digest 7 все — добавить аналитику и назначения\n"
         "/mode — выбрать режим разбора\n"
         "/reparse — переразобрать всё заново\n"
         "/sources — сравнение полноты источников\n"
@@ -156,16 +180,26 @@ async def cmd_update(msg: types.Message):
 async def cmd_digest(msg: types.Message):
     if not _allowed(msg.from_user.id):
         return
-    parts = (msg.text or "").split(maxsplit=2)
+    parts = (msg.text or "").split()[1:]
+
+    show_rest = False
+    for word in ("все", "всё", "all"):
+        if word in [p.lower() for p in parts]:
+            show_rest = True
+            parts = [p for p in parts if p.lower() != word]
+            break
+
     days, location = 1.0, None
-    if len(parts) > 1:
+    if parts:
         try:
-            days = float(parts[1].replace(",", "."))
+            days = float(parts[0].replace(",", "."))
+            parts = parts[1:]
         except ValueError:
-            location = " ".join(parts[1:])
-    if len(parts) > 2 and location is None:
-        location = parts[2]
-    await send_digest(msg.chat.id, days, f"{days:g} дн.", location)
+            pass
+        if parts:
+            location = " ".join(parts)
+
+    await send_digest(msg.chat.id, days, f"{days:g} дн.", location, show_rest)
 
 
 @dp.message(Command("sources"))

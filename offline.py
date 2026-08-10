@@ -123,36 +123,62 @@ MONEY_RE = re.compile(
 
 AD_MARKERS = ("реклама", "erid", "рекламодатель", "бронирование билетов")
 
-QUOTES = " \t\u00a0«»\"'.,:;—–-"
+QUOTES = " \t\u00a0\"'.,:;—–-"
+
+# «у ВТБ», «у семьи Иванова» после глагола покупки — это продавец
+FROM_WHOM_RE = re.compile(r"^\s*у\s+(«[^»]{2,50}»|[А-ЯЁ][^,]{1,45}?)(?=\s|$)")
+# хвост про цену обрезаем: «за 13,5 млрд»
+PRICE_TAIL_RE = re.compile(r"\s+за\s+\d.*$")
+
+
+def _tidy(s: str) -> str:
+    """Аккуратная обрезка: не разрывает кавычки и не глотает закрывающую."""
+    s = s.strip(QUOTES)
+    if s.count("«") > s.count("»"):
+        s += "»"
+    if s.count("»") > s.count("«"):
+        s = "«" + s
+    return s.strip()
 
 
 def _find_verb(text: str, verbs: list[str]) -> tuple[str, int] | None:
+    """Ищем самую длинную подходящую форму.
+
+    Иначе «купил» сработает внутри «купила» и откусит от хвоста лишнюю букву.
+    """
     low = text.lower()
+    best: tuple[str, int] | None = None
     for v in verbs:
         pos = low.find(v)
-        if pos != -1:
-            return v, pos
-    return None
+        if pos == -1:
+            continue
+        if best is None or len(v) > len(best[0]):
+            best = (v, pos)
+    return best
 
 
 def _actor_before(text: str, pos: int) -> str | None:
     """Кто действует — обычно всё, что стоит до глагола."""
-    part = text[:pos].strip(QUOTES)
+    part = text[:pos].strip()
     if not part or len(part) > 70:
         return None
-    # отсекаем вводные вроде «СМИ сообщили:»
-    part = re.sub(r"^(СМИ|Источник\w*|Эксперт\w*)[:,]\s*", "", part).strip(QUOTES)
-    return part or None
+    part = re.sub(r"^(СМИ|Источник\w*|Эксперт\w*)[:,]\s*", "", part)
+    return _tidy(part) or None
 
 
-def _object_after(text: str, pos: int, verb: str) -> str | None:
-    part = text[pos + len(verb) :].strip(QUOTES)
-    if not part:
-        return None
-    # обрезаем хвост про место и цену — они попадут в свои поля
-    part = re.split(r"\s+(?:в|на|за|под|у)\s+[А-ЯЁ0-9]", part)[0]
-    part = part.strip(QUOTES)
-    return part[:90] or None
+def _split_tail(text: str, pos: int, verb: str) -> tuple[str | None, str | None]:
+    """Разбирает хвост после глагола на продавца («у кого») и объект."""
+    tail = text[pos + len(verb) :]
+
+    seller = None
+    m = FROM_WHOM_RE.match(tail)
+    if m:
+        seller = _tidy(m.group(1))
+        tail = tail[m.end() :]
+
+    tail = PRICE_TAIL_RE.sub("", tail)
+    obj = _tidy(tail)[:90]
+    return seller, (obj or None)
 
 
 def _location(text: str) -> str | None:
@@ -230,6 +256,7 @@ def extract(title: str, text: str, category: str | None) -> dict:
             "object": obj,
             "amount": _amount(haystack),
             "stage": "выставлено на торги",
+            "done": False,   # объявлены торги — сделки ещё нет
             "summary": None,
         }
 
@@ -237,25 +264,31 @@ def extract(title: str, text: str, category: str | None) -> dict:
     if hit:
         verb, pos = hit
         buyer = _actor_before(title, pos)
-        obj = _object_after(title, pos, verb)
+        seller, obj = _split_tail(title, pos, verb)
         if any(m in verb for m in RENT_MARKERS):
             kind = "аренда"
 
     hit = _find_verb(title, SELL_VERBS)
     if hit:
         verb, pos = hit
-        seller = _actor_before(title, pos)
+        if not seller:
+            seller = _actor_before(title, pos)
         if obj is None:
-            obj = _object_after(title, pos, verb)
+            _, obj = _split_tail(title, pos, verb)
 
     # Если в заголовке есть действие со сторонами — это сделка, что бы ни
     # говорила рубрика источника. Рубрики на сайте размечены ненадёжно.
     if (buyer or seller) and kind in ("прочее", "аналитика", "назначение"):
         kind = "аренда" if _find_verb(title, ["аренд", "снял"]) else "сделка"
 
+    # Нашли сторону через глагол прошедшего времени — считаем состоявшейся.
+    # Правила не различают оттенки, модель делает это точнее.
+    done = bool(buyer or seller)
+
     return {
         "relevant": True,
         "kind": kind,
+        "done": done,
         "buyer": buyer,
         "seller": seller,
         "location": _location(haystack),

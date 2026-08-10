@@ -16,6 +16,9 @@ import config
 _lock = threading.Lock()
 _conn: sqlite3.Connection | None = None
 
+# Что считаем сделкой. Остальное (назначения, аналитика, проекты) — в хвост.
+DEAL_KINDS = ("сделка", "аренда", "аукцион", "инвестиция")
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS items (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -37,6 +40,7 @@ CREATE TABLE IF NOT EXISTS items (
     amount      TEXT,
     stage       TEXT,
     kind        TEXT,
+    done        INTEGER NOT NULL DEFAULT 0,   -- сделка состоялась, а не в процессе
     summary     TEXT,
     UNIQUE(source, ext_id)
 );
@@ -57,6 +61,11 @@ def init() -> None:
     _conn.row_factory = sqlite3.Row
     with _lock:
         _conn.executescript(SCHEMA)
+        # база могла быть создана до появления колонки done
+        try:
+            _conn.execute("ALTER TABLE items ADD COLUMN done INTEGER NOT NULL DEFAULT 0")
+        except sqlite3.OperationalError:
+            pass  # колонка уже есть
         _conn.commit()
 
 
@@ -126,7 +135,7 @@ def save_extraction(item_id: int, data: dict) -> None:
     with _lock:
         _conn.execute(
             "UPDATE items SET status=?, buyer=?, seller=?, location=?, object=?,"
-            " amount=?, stage=?, kind=?, summary=? WHERE id=?",
+            " amount=?, stage=?, kind=?, done=?, summary=? WHERE id=?",
             (
                 status,
                 data.get("buyer"),
@@ -136,6 +145,7 @@ def save_extraction(item_id: int, data: dict) -> None:
                 data.get("amount"),
                 data.get("stage"),
                 data.get("kind"),
+                1 if data.get("done") else 0,
                 data.get("summary"),
                 item_id,
             ),
@@ -153,12 +163,32 @@ def _since(days: float) -> str:
     return (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
 
 
+def _placeholders(n: int) -> str:
+    return ",".join("?" * n)
+
+
 def deals(days: float, location: str | None = None) -> list[sqlite3.Row]:
+    """Состоявшиеся сделки — они и попадают в карточки."""
     sql = (
-        "SELECT * FROM items WHERE status='parsed' AND is_dup=0"
-        " AND kind NOT IN ('назначение','аналитика','прочее') AND published >= ?"
+        "SELECT * FROM items WHERE status='parsed' AND is_dup=0 AND done=1"
+        f" AND kind IN ({_placeholders(len(DEAL_KINDS))}) AND published >= ?"
     )
-    args: list = [_since(days)]
+    args: list = [*DEAL_KINDS, _since(days)]
+    if location:
+        sql += " AND location LIKE ?"
+        args.append(f"%{location}%")
+    sql += " ORDER BY published DESC"
+    with _lock:
+        return _conn.execute(sql, args).fetchall()
+
+
+def in_progress(days: float, location: str | None = None) -> list[sqlite3.Row]:
+    """Слухи, переговоры, выставленное на продажу — сделка ещё не состоялась."""
+    sql = (
+        "SELECT * FROM items WHERE status='parsed' AND is_dup=0 AND done=0"
+        f" AND kind IN ({_placeholders(len(DEAL_KINDS))}) AND published >= ?"
+    )
+    args: list = [*DEAL_KINDS, _since(days)]
     if location:
         sql += " AND location LIKE ?"
         args.append(f"%{location}%")
@@ -168,14 +198,14 @@ def deals(days: float, location: str | None = None) -> list[sqlite3.Row]:
 
 
 def rest(days: float) -> list[sqlite3.Row]:
-    """Хвост: назначения, аналитика и прочее — компактным списком."""
+    """Всё несделочное: аналитика, назначения, проекты. Только по запросу."""
+    sql = (
+        "SELECT * FROM items WHERE status='parsed' AND is_dup=0"
+        f" AND (kind IS NULL OR kind NOT IN ({_placeholders(len(DEAL_KINDS))}))"
+        " AND published >= ? ORDER BY published DESC"
+    )
     with _lock:
-        return _conn.execute(
-            "SELECT * FROM items WHERE status='parsed' AND is_dup=0"
-            " AND kind IN ('назначение','аналитика','прочее') AND published >= ?"
-            " ORDER BY published DESC",
-            (_since(days),),
-        ).fetchall()
+        return _conn.execute(sql, [*DEAL_KINDS, _since(days)]).fetchall()
 
 
 def stats() -> dict:
@@ -244,7 +274,7 @@ def reset_parsed() -> int:
     with _lock:
         cur = _conn.execute(
             "UPDATE items SET status='new', buyer=NULL, seller=NULL, location=NULL,"
-            " object=NULL, amount=NULL, stage=NULL, kind=NULL, summary=NULL"
+            " object=NULL, amount=NULL, stage=NULL, kind=NULL, done=0, summary=NULL"
             " WHERE status IN ('parsed','skipped','error')"
         )
         _conn.commit()
