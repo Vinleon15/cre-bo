@@ -13,6 +13,7 @@ from aiogram.filters import Command, CommandStart
 import config
 import db
 import extractor
+import merge
 import sources
 
 log = logging.getLogger("bot")
@@ -60,22 +61,33 @@ def esc(v) -> str:
     return html.escape(str(v)) if v else ""
 
 
-def format_deal(row) -> str:
-    icon = KIND_ICONS.get(row["kind"] or "", "📌")
-    dt = datetime.fromisoformat(row["published"]).strftime("%d.%m")
-    head = esc(row["object"]) or esc(row["title"])[:80]
+def format_deal(card: dict) -> str:
+    """Карточка сделки. На вход — объединённая запись из merge.combine."""
+    icon = KIND_ICONS.get(card.get("kind") or "", "📌")
+    dt = datetime.fromisoformat(card["published"]).strftime("%d.%m")
 
-    lines = [f"{icon} <b>{head}</b>"]
-    if row["summary"]:
-        lines.append(f"<i>{esc(row['summary'])}</i>")
-    lines.append(f"👤 Покупатель: {esc(row['buyer']) or '—'}")
-    lines.append(f"🏷 Продавец: {esc(row['seller']) or '—'}")
-    lines.append(f"📍 Локация: {esc(row['location']) or '—'}")
-    if row["amount"]:
-        lines.append(f"💰 {esc(row['amount'])}")
-    if row["stage"]:
-        lines.append(f"📊 {esc(row['stage'])}")
-    lines.append(f'🔗 <a href="{row["url"]}">Источник</a> · {dt}')
+    lines = [f"{icon} <b>{esc(card.get('object')) or 'Сделка'}</b>"]
+    if card.get("summary"):
+        lines.append(f"<i>{esc(card['summary'])}</i>")
+    lines.append(f"👤 Покупатель: {esc(card.get('buyer')) or '—'}")
+    lines.append(f"🏷 Продавец: {esc(card.get('seller')) or '—'}")
+    lines.append(f"📍 Локация: {esc(card.get('location')) or '—'}")
+    if card.get("amount"):
+        lines.append(f"💰 {esc(card['amount'])}")
+    if card.get("area"):
+        lines.append(f"📐 {esc(card['area'])}")
+    if card.get("stage"):
+        lines.append(f"📊 {esc(card['stage'])}")
+
+    sources = card.get("sources") or []
+    if len(sources) == 1:
+        lines.append(f'🔗 <a href="{sources[0][0]}">Источник</a> · {dt}')
+    else:
+        links = " · ".join(
+            f'<a href="{url}">{i}</a>' for i, (url, _) in enumerate(sources, 1)
+        )
+        lines.append(f"🔗 {len(sources)} источника: {links} · {dt}")
+
     return "\n".join(lines)
 
 
@@ -86,7 +98,9 @@ def build_digest(
     show_rest: bool = False,
 ) -> list[str]:
     """Три блока: состоявшиеся сделки, сделки в процессе и (по запросу) прочее."""
-    done = db.deals(days, location)
+    # склейка считается на лету: новая публикация о той же сделке
+    # подхватится в объединённую карточку автоматически
+    done = merge.merged(db.deals(days, location))
     pending = db.in_progress(days, location)
     tail = db.rest(days) if show_rest else []
 

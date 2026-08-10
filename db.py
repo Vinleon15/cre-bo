@@ -38,6 +38,7 @@ CREATE TABLE IF NOT EXISTS items (
     location    TEXT,
     object      TEXT,
     amount      TEXT,
+    area        TEXT,
     stage       TEXT,
     kind        TEXT,
     done        INTEGER NOT NULL DEFAULT 0,   -- сделка состоялась, а не в процессе
@@ -62,10 +63,11 @@ def init() -> None:
     with _lock:
         _conn.executescript(SCHEMA)
         # база могла быть создана до появления колонки done
-        try:
-            _conn.execute("ALTER TABLE items ADD COLUMN done INTEGER NOT NULL DEFAULT 0")
-        except sqlite3.OperationalError:
-            pass  # колонка уже есть
+        for col, decl in (("done", "INTEGER NOT NULL DEFAULT 0"), ("area", "TEXT")):
+            try:
+                _conn.execute(f"ALTER TABLE items ADD COLUMN {col} {decl}")
+            except sqlite3.OperationalError:
+                pass  # колонка уже есть
         _conn.commit()
 
 
@@ -135,7 +137,7 @@ def save_extraction(item_id: int, data: dict) -> None:
     with _lock:
         _conn.execute(
             "UPDATE items SET status=?, buyer=?, seller=?, location=?, object=?,"
-            " amount=?, stage=?, kind=?, done=?, summary=? WHERE id=?",
+            " amount=?, area=?, stage=?, kind=?, done=?, summary=? WHERE id=?",
             (
                 status,
                 data.get("buyer"),
@@ -143,6 +145,7 @@ def save_extraction(item_id: int, data: dict) -> None:
                 data.get("location"),
                 data.get("object"),
                 data.get("amount"),
+                data.get("area"),
                 data.get("stage"),
                 data.get("kind"),
                 1 if data.get("done") else 0,
@@ -274,7 +277,8 @@ def reset_parsed() -> int:
     with _lock:
         cur = _conn.execute(
             "UPDATE items SET status='new', buyer=NULL, seller=NULL, location=NULL,"
-            " object=NULL, amount=NULL, stage=NULL, kind=NULL, done=0, summary=NULL"
+            " object=NULL, amount=NULL, area=NULL, stage=NULL, kind=NULL,"
+            " done=0, summary=NULL"
             " WHERE status IN ('parsed','skipped','error')"
         )
         _conn.commit()

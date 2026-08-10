@@ -208,24 +208,21 @@ def _clean(s: str) -> str:
     return re.sub(r"\s+", " ", s).strip(" ,.")
 
 
-def _amount(text: str) -> str | None:
-    """Сумма и площадь — оба полезны, показываем что нашли."""
-    parts = []
+def _area(text: str) -> str | None:
+    m = AREA_RE.search(text)
+    return _clean(m.group(0)) if m else None
 
+
+def _amount(text: str) -> str | None:
+    """Только деньги. Площадь возвращает _area отдельно."""
     for m in MONEY_RE.finditer(text):
         tail = text[m.end() : m.end() + 8].lower()
         if "кв" in tail:  # это площадь, а не деньги
             continue
         if not m.group(3) and "за" not in m.group(0).lower():
             continue  # ни валюты, ни предлога «за» — скорее всего не цена
-        parts.append(_clean(m.group(0).replace("за ", "")))
-        break
-
-    m = AREA_RE.search(text)
-    if m:
-        parts.append(_clean(m.group(0)))
-
-    return " · ".join(parts) if parts else None
+        return _clean(m.group(0).replace("за ", ""))
+    return None
 
 
 def extract(title: str, text: str, category: str | None) -> dict:
@@ -255,6 +252,7 @@ def extract(title: str, text: str, category: str | None) -> dict:
             "location": _location(haystack),
             "object": obj,
             "amount": _amount(haystack),
+            "area": _area(haystack),
             "stage": "выставлено на торги",
             "done": False,   # объявлены торги — сделки ещё нет
             "summary": None,
@@ -294,6 +292,7 @@ def extract(title: str, text: str, category: str | None) -> dict:
         "location": _location(haystack),
         "object": obj,
         "amount": _amount(haystack),
+        "area": _area(haystack),
         "stage": None,
         "summary": None,
     }
