@@ -61,7 +61,10 @@ async def worker():
 
         if config.DAILY_DIGEST_HOUR is not None:
             now = datetime.now()
-            if now.hour == config.DAILY_DIGEST_HOUR and last_digest_date != now.date():
+            # Не «сейчас ровно этот час», а «нужный час сегодня уже наступил».
+            # Иначе цикл, просыпающийся раз в час, может проспать момент.
+            due = now.hour >= config.DAILY_DIGEST_HOUR
+            if due and last_digest_date != now.date():
                 last_digest_date = now.date()
                 for uid in config.OWNER_IDS:
                     try:

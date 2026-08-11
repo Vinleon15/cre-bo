@@ -13,6 +13,14 @@ import requests
 
 import config
 
+if not config.GIGACHAT_VERIFY_SSL:
+    # Проверка сертификата отключена сознательно (нет сертификатов Минцифры).
+    # Глушим повторяющееся предупреждение, чтобы не забивало логи —
+    # о самом факте отключения написано в README и отчёте.
+    import urllib3
+
+    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
 log = logging.getLogger("gigachat")
 
 OAUTH_URL = "https://ngw.devices.sberbank.ru:9443/api/v2/oauth"
