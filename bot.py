@@ -42,6 +42,16 @@ KIND_ICONS = {
 
 
 def _allowed(user_id: int) -> bool:
+    """Чтение сводок. Открыто всем: бот не публикуется, имя знают свои."""
+    return True
+
+
+def _is_owner(user_id: int) -> bool:
+    """Управление: сбор, переразбор, смена режима. Только владельцу.
+
+    Отделено от чтения, потому что эти команды тратят токены модели
+    и меняют содержимое базы для всех.
+    """
     return user_id in config.OWNER_IDS
 
 
@@ -177,8 +187,11 @@ async def cmd_start(msg: types.Message):
 
 @dp.message(Command("update"))
 async def cmd_update(msg: types.Message):
-    if not _allowed(msg.from_user.id):
-        return
+    if not _is_owner(msg.from_user.id):
+        return await msg.answer(
+            "Эта команда доступна только владельцу бота.\n"
+            "Сводка: /digest 7"
+        )
     note = await msg.answer("Забираю свежее…")
     added = await asyncio.to_thread(sources.collect_all)
     await note.edit_text(f"Загружено новых материалов: {added}. Разбираю…")
@@ -267,8 +280,11 @@ def _mode_kb() -> types.InlineKeyboardMarkup:
 
 @dp.message(Command("mode"))
 async def cmd_mode(msg: types.Message):
-    if not _allowed(msg.from_user.id):
-        return
+    if not _is_owner(msg.from_user.id):
+        return await msg.answer(
+            "Эта команда доступна только владельцу бота.\n"
+            "Сводка: /digest 7"
+        )
     await msg.answer(
         "<b>Режим разбора</b>\n\n"
         "<b>Бесплатно</b> — правилами по заголовку. Ничего не стоит, "
@@ -285,8 +301,11 @@ async def cmd_mode(msg: types.Message):
 
 @dp.message(Command("reparse"))
 async def cmd_reparse(msg: types.Message):
-    if not _allowed(msg.from_user.id):
-        return
+    if not _is_owner(msg.from_user.id):
+        return await msg.answer(
+            "Эта команда доступна только владельцу бота.\n"
+            "Сводка: /digest 7"
+        )
     count = db.reset_parsed()
     if not count:
         return await msg.answer("Разбирать нечего — база пуста.")
@@ -301,8 +320,11 @@ async def cmd_reparse(msg: types.Message):
 @dp.message(Command("check"))
 async def cmd_check(msg: types.Message):
     """Проверка связи с GigaChat — чтобы не гадать, в чём дело."""
-    if not _allowed(msg.from_user.id):
-        return
+    if not _is_owner(msg.from_user.id):
+        return await msg.answer(
+            "Эта команда доступна только владельцу бота.\n"
+            "Сводка: /digest 7"
+        )
     import gigachat
 
     note = await msg.answer("Проверяю связь…")
@@ -312,8 +334,8 @@ async def cmd_check(msg: types.Message):
 
 @dp.callback_query(F.data.startswith("m:"))
 async def cb_mode(cq: types.CallbackQuery):
-    if not _allowed(cq.from_user.id):
-        return await cq.answer()
+    if not _is_owner(cq.from_user.id):
+        return await cq.answer("Только для владельца", show_alert=True)
     mode = cq.data.split(":")[1]
     if mode not in config.MODE_NAMES:
         return await cq.answer("Неизвестный режим")
