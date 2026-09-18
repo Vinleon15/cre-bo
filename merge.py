@@ -15,9 +15,18 @@ import re
 from datetime import datetime
 
 # Сколько общих слов достаточно, чтобы счесть карточки одной сделкой.
-# Двух не хватало: совпадения вроде «покупатель + сумма» встречаются
-# у разных сделок одного игрока и склеивали их в одну карточку.
-MIN_COMMON = 3
+# Двух хватает, но только если среди совпавших есть опорное — из названия
+# объекта или адреса. Без этого условия двойка ловит «покупатель + сумма»
+# и склеивает разные сделки одного игрока. С тремя же переставали
+# сходиться настоящие дубли: у пары «А22» и «СберСити» общих примет
+# ровно две.
+MIN_COMMON = 2
+
+# Приметы, по которым узнаётся сама площадка, а не обстоятельства сделки.
+# Тот же приём, что в objects.py: участники и сумма меняются от сделки к
+# сделке, название и адрес — нет.
+def _core(row) -> set[str]:
+    return _stems(row["object"], row["location"])
 
 # Карточки дальше друг от друга по времени не склеиваем: у одного покупателя
 # может быть несколько разных сделок за год.
@@ -33,6 +42,11 @@ STOP = {
     "около", "более", "менее", "новый", "новая", "проект", "объект",
     "здание", "участо", "помеще", "площад", "центр", "бизнес", "офисны",
     "офис", "фонд", "акции", "акций", "структ", "инвест",
+    # Общие слова адреса. Без них «Дмитровское шоссе» и «Каширское шоссе»
+    # роднятся по слову «шоссе», и две разные сделки сходятся в одну.
+    "шоссе", "улица", "улице", "улицы", "проспе", "переул", "набере",
+    "бульва", "район", "округ", "город", "корпус", "строен", "владен",
+    "руб", "доллар", "евро",
 }
 
 
@@ -64,28 +78,21 @@ def _published(row) -> datetime:
     return datetime.fromisoformat(row["published"])
 
 
-def _same_deal(a_key: set[str], b_key: set[str]) -> bool:
-    return len(a_key & b_key) >= MIN_COMMON
+def _same_deal(a_key: set[str], b_key: set[str],
+               a_core: set[str], b_core: set[str]) -> bool:
+    common = a_key & b_key
+    if not common & (a_core | b_core):
+        return False  # сошлось только на сумме или участниках — не довод
+    if len(common) >= MIN_COMMON:
+        return True
+    # Карточка может быть описана предельно скупо — «БЦ «Фрейм»» и всё.
+    # Двух совпадений она не наберёт никогда, но если все её приметы есть
+    # у другой карточки, это она же, только пересказанная короче.
+    small = a_key if len(a_key) <= len(b_key) else b_key
+    return len(small) <= 2 and common == small
 
 
-def group_by_object(rows: list) -> tuple[list[list], list]:
-    """Сначала группируем по постоянному id объекта.
-
-    Это надёжнее сравнения слов: связь уже установлена при разборе
-    и учитывает всю накопленную историю, а не только текущую выборку.
-    """
-    buckets: dict[int, list] = {}
-    rest: list = []
-    for row in rows:
-        oid = row["object_id"] if "object_id" in row.keys() else None
-        if oid:
-            buckets.setdefault(oid, []).append(row)
-        else:
-            rest.append(row)
-    return list(buckets.values()), rest
-
-
-def group(rows: list) -> list[list]:
+def group(rows: list, linked: list | None = None) -> list[list]:
     """Разбивает карточки на группы. Связь транзитивна: A~B, B~C → одна группа.
 
     Пример: «18% акций Самолета» и «акция компании Самолет» связаны словом
@@ -93,6 +100,7 @@ def group(rows: list) -> list[list]:
     хотя со второй напрямую общих слов не имеет.
     """
     keys = [_key(r) for r in rows]
+    cores = [_core(r) for r in rows]
     parent = list(range(len(rows)))
 
     def find(i: int) -> int:
@@ -106,10 +114,16 @@ def group(rows: list) -> list[list]:
         if ri != rj:
             parent[rj] = ri
 
+    # Сначала — связи, установленные при разборе: одинаковый объект.
+    # Это сильная связь, на неё ограничение по времени не распространяется.
+    for pair in (linked or []):
+        union(*pair)
+
     for i in range(len(rows)):
         for j in range(i + 1, len(rows)):
             gap = abs((_published(rows[i]) - _published(rows[j])).days)
-            if gap <= MAX_GAP_DAYS and _same_deal(keys[i], keys[j]):
+            if gap <= MAX_GAP_DAYS and _same_deal(keys[i], keys[j],
+                                                  cores[i], cores[j]):
                 union(i, j)
 
     buckets: dict[int, list] = {}
@@ -209,8 +223,23 @@ def combine(rows: list) -> dict:
 
 def merged(rows: list) -> list[dict]:
     """Главная функция: из списка карточек — список объединённых."""
-    by_object, rest = group_by_object(rows)
-    # у кого объекта ещё нет — досклеиваем по словам, как раньше
-    groups = by_object + group(rest)
+    # Раньше карточки с назначенным объектом раскладывались по объектам и
+    # между собой не сравнивались вовсе — словесная склейка доставалась
+    # только остатку. Пока объекты были «липкими», это сходило с рук.
+    # После того как привязка к объектам стала строже, карточки одного
+    # события разъехались по разным объектам, и склейка их не видела.
+    # Теперь одинаковый объект — просто готовая связь, поверх которой
+    # работает общее сравнение.
+    by_oid: dict = {}
+    linked: list = []
+    for idx, row in enumerate(rows):
+        oid = row["object_id"] if "object_id" in row.keys() else None
+        if oid:
+            if oid in by_oid:
+                linked.append((by_oid[oid], idx))
+            else:
+                by_oid[oid] = idx
+
+    groups = group(rows, linked)
     groups.sort(key=lambda g: max(_published(r) for r in g), reverse=True)
     return [combine(g) for g in groups]
