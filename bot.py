@@ -20,6 +20,26 @@ import sources
 
 log = logging.getLogger("bot")
 
+# Сколько материалов берём за один ручной заход. Столько же берёт фоновый
+# обход в main.py — величина проверена на живом потоке.
+BATCH = 200
+
+# Выбрать всю очередь целиком: у SQLite нет «без предела», поэтому просто
+# число заведомо больше любой реальной базы.
+ALL_PENDING = 1_000_000
+
+
+def _eta(count: int) -> str:
+    """Сколько примерно займёт разбор. Считаем по паузе между запросами
+    к модели, а не зашитой цифрой — поменяется пауза, поменяется оценка."""
+    if extractor.current_mode() == "free":
+        return "меньше минуты"
+    import gigachat
+    minutes = round(count * gigachat.MIN_INTERVAL / 60)
+    if minutes < 1:
+        return "меньше минуты"
+    return f"{minutes} мин"
+
 _session = None
 if config.PROXY_URL:
     from aiogram.client.session.aiohttp import AiohttpSession
@@ -260,7 +280,7 @@ async def cmd_update(msg: types.Message):
     note = await msg.answer("Забираю свежее…")
     added = await asyncio.to_thread(sources.collect_all)
     await note.edit_text(f"Загружено новых материалов: {added}. Разбираю…")
-    parsed, error = await extractor.process_pending()
+    parsed, error = await extractor.process_pending(limit=BATCH)
     mode = config.MODE_NAMES.get(extractor.current_mode(), "?")
     msg = f"Готово. Новых материалов: {added}, распознано: {parsed}.\nРежим: {mode}"
     if error:
@@ -371,15 +391,25 @@ async def cmd_reparse(msg: types.Message):
             "Эта команда доступна только владельцу бота.\n"
             "Сводка: /digest 7"
         )
-    count = db.reset_parsed()
-    if not count:
+    # Сбрасываем разобранное — но разбирать нужно всю очередь целиком.
+    # reset_parsed() возвращает только то, что сбросил этой командой, а в
+    # очереди может уже лежать хвост от прерванного прогона. Раньше в
+    # разбор уходило число сброшенных, и хвост оставался за бортом:
+    # ответ «452 из 484» при 833 ожидающих читался как поломка.
+    reset = db.reset_parsed()
+    queue = len(db.pending(ALL_PENDING))
+    if not queue:
         return await msg.answer("Разбирать нечего — база пуста.")
-    note = await msg.answer(f"Сбросил разбор у {count} материалов. Разбираю заново…")
-    parsed, error = await extractor.process_pending(limit=count)
-    text = f"Готово. Распознано: {parsed} из {count}."
+
+    note = await msg.answer(
+        f"Сбросил разбор у {reset} материалов, в очереди {queue}.\n"
+        f"Разбираю — это примерно {_eta(queue)}…"
+    )
+    parsed, error = await extractor.process_pending(limit=queue)
+    text = f"Готово. Распознано: {parsed} из {queue}."
     # Разбор мог прерваться — тогда часть материалов осталась со сброшенным
     # статусом, и сводка будет неполной. Молчать об этом нельзя.
-    left = len(db.pending(count))
+    left = len(db.pending(ALL_PENDING))
     if left:
         text += (f"\n\n⚠️ Осталось неразобранных: {left}. "
                  f"Они подхватятся при следующем обходе или командой /update.")
