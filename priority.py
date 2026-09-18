@@ -35,6 +35,33 @@ def looks_not_done(text: str) -> bool:
     return any(m in low for m in NOT_DONE_MARKERS)
 
 
+# ------------------------------------------------- сделка без предмета
+
+# Сделочные типы: у настоящей сделки всегда есть хотя бы одно из трёх —
+# объект, покупатель, продавец.
+SUBJECT_KINDS = {"сделка", "аренда", "аукцион", "инвестиция",
+                 "банкротство", "суд"}
+
+
+def has_subject(data: dict) -> bool:
+    return any(data.get(f) for f in ("object", "buyer", "seller"))
+
+
+def demote_marketwide(data: dict) -> dict:
+    """Новость без предмета сделкой не считается.
+
+    «Фонды увеличили выплаты пайщикам», «доля аукционов достигла 30%»,
+    «кредиторы утвердили мировое соглашение» — обзор рынка, а не событие
+    с конкретным активом. Инструкцию про это модель получает, но держит
+    нетвёрдо, поэтому проверяем поверх ответа — тем же приёмом, что и
+    looks_not_done. Проверка безопасная: у настоящей сделки хоть одно из
+    трёх полей заполнено, так что ничего живого не потеряется.
+    """
+    if data.get("kind") in SUBJECT_KINDS and not has_subject(data):
+        data["kind"] = "аналитика"
+    return data
+
+
 # --------------------------------------------------------------- приоритет
 
 # Банкротство и суд важны независимо от суммы — это сигнал риска,
@@ -103,11 +130,15 @@ def score(kind: str | None, amount: str | None, area: str | None) -> str:
     """Возвращает 'высокий' | 'средний' | 'низкий'."""
     k = kind or ""
 
-    if k in ALWAYS_HIGH:
-        return "высокий"
-
     rub = _to_rub(amount)
     size, in_hectares = _to_area(area)
+
+    # Банкротство и суд — сигнал риска, а не размера, поэтому порогов для
+    # них нет. Но проверяется это ДО порогов и только когда размер вообще
+    # назван: иначе каждое «кредиторы утвердили мировое соглашение» красит
+    # сводку в красный, и метка перестаёт выделять главное.
+    if k in ALWAYS_HIGH and (rub is not None or size is not None):
+        return "высокий"
 
     if rub is not None:
         if rub >= LARGE_AMOUNT:
@@ -126,7 +157,7 @@ def score(kind: str | None, amount: str | None, area: str | None) -> str:
             # площадь маленькая, денег нет — типичная мелкая аренда офиса
             return "низкий"
 
-    if k in MILESTONE_KINDS:
+    if k in MILESTONE_KINDS or k in ALWAYS_HIGH:
         return "средний"
 
     if rub is None and size is None:
@@ -185,6 +216,8 @@ def finalize(data: dict, title: str, text: str = "") -> dict:
 
     if data.get("done") and looks_not_done(f"{title} {text[:400]}"):
         data["done"] = False
+
+    data = demote_marketwide(data)
 
     data["priority"] = score(data.get("kind"), data.get("amount"),
                              data.get("area"))
