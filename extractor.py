@@ -33,6 +33,20 @@ def _busy_on() -> None:
         log.warning("Не удалось поставить отметку занятости")
 
 
+def is_busy() -> bool:
+    """Идёт ли разбор прямо сейчас.
+
+    Отметку старше получаса считаем брошенной после сбоя — иначе одна
+    неудача заблокировала бы команды навсегда. Тот же срок, что и в
+    update.sh, и по той же причине.
+    """
+    try:
+        age = time.time() - os.path.getmtime(BUSY_FILE)
+    except OSError:
+        return False
+    return age < 1800
+
+
 def _busy_off() -> None:
     try:
         os.remove(BUSY_FILE)
