@@ -9,3 +9,8 @@
 # Питон
 __pycache__/
 *.pyc
+
+# tokensave
+*.db
+*.db-wal
+*.db-shm
