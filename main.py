@@ -36,7 +36,11 @@ async def worker():
         log.info("Фоновый сбор выключен")
         return
 
-    last_digest_date = None
+    # Дата последней отправленной сводки лежит в базе, а не в памяти.
+    # Раньше она жила переменной и обнулялась при каждом перезапуске:
+    # условие «нужный час сегодня уже наступил» после этого срабатывало
+    # снова, и сводка приходила повторно. С автообновлением, которое
+    # перезапускает бот при каждом новом коммите, это стало заметно.
     while True:
         try:
             added, parsed = await collect_cycle()
@@ -64,8 +68,9 @@ async def worker():
             # Не «сейчас ровно этот час», а «нужный час сегодня уже наступил».
             # Иначе цикл, просыпающийся раз в час, может проспать момент.
             due = now.hour >= config.DAILY_DIGEST_HOUR
-            if due and last_digest_date != now.date():
-                last_digest_date = now.date()
+            today = now.date().isoformat()
+            if due and db.get_setting("last_digest_date") != today:
+                db.set_setting("last_digest_date", today)
                 for uid in config.OWNER_IDS:
                     try:
                         await bot_module.send_digest(uid, 1.0, "сутки")
