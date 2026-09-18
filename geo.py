@@ -15,6 +15,7 @@
 import logging
 import math
 import time
+from datetime import datetime, timezone
 
 import requests
 
@@ -34,6 +35,35 @@ _last_call = 0.0
 GOOD_PRECISION = ("exact", "number", "near")
 
 URL = "https://geocode-maps.yandex.ru/1.x/"
+
+
+def _spent_today() -> int:
+    """Сколько обращений к геокодеру сделано сегодня.
+
+    Бесплатный предел считается за сутки, и он невелик. Без своего счёта
+    первый же полный переразбор сожжёт его на сотне материалов, а
+    остальные адреса получат отказ — и, что хуже, запомнятся как
+    ненайденные.
+    """
+    today = datetime.now(timezone.utc).date().isoformat()
+    if db.get_setting("geo_day") != today:
+        return 0
+    try:
+        return int(db.get_setting("geo_spent") or 0)
+    except ValueError:
+        return 0
+
+
+def _count_call() -> None:
+    today = datetime.now(timezone.utc).date().isoformat()
+    if db.get_setting("geo_day") != today:
+        db.set_setting("geo_day", today)
+        db.set_setting("geo_spent", "0")
+    db.set_setting("geo_spent", str(_spent_today() + 1))
+
+
+def budget_left() -> int:
+    return max(config.GEO_DAILY_LIMIT - _spent_today(), 0)
 
 
 def _throttle() -> None:
@@ -84,8 +114,17 @@ def point(address: str | None) -> tuple[float, float] | None:
 
     row = db.geocache_get(address)
     if row is None:
+        if not budget_left():
+            log.info("Дневной предел геокодера исчерпан, адрес %r отложен",
+                     address)
+            return None
+        _count_call()
         lat, lon, precision = _ask(address)
-        db.geocache_put(address, lat, lon, precision)
+        # Запоминаем только настоящий ответ. «Геокодер не ответил» — это
+        # сеть или исчерпанный предел, а не свойство адреса: запиши мы
+        # такое в кэш, адрес больше никогда бы не переспросили.
+        if precision is not None:
+            db.geocache_put(address, lat, lon, precision)
     else:
         lat, lon, precision = row["lat"], row["lon"], row["precision"]
 

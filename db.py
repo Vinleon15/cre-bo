@@ -439,11 +439,16 @@ def object_timeline(object_id: int) -> list[sqlite3.Row]:
 
 
 def unlinked_parsed(limit: int = 500) -> list[sqlite3.Row]:
-    """Разобранные материалы, ещё не привязанные к объекту."""
+    """Разобранные материалы, ещё не привязанные к объекту.
+
+    Свежие впереди: суточный предел геокодера невелик, и тратить его
+    разумнее на то, что человек прочтёт сегодня, а не на позапрошлую
+    неделю. Накопленное доберётся за следующие дни.
+    """
     with _lock:
         return _conn.execute(
             "SELECT * FROM items WHERE status='parsed' AND object_id IS NULL"
-            " ORDER BY published LIMIT ?", (limit,)
+            " ORDER BY published DESC LIMIT ?", (limit,)
         ).fetchall()
 
 

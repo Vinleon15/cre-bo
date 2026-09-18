@@ -153,7 +153,13 @@ def attach(row) -> tuple[int, bool]:
     # Сначала карта. Адрес приводит модель, координаты даёт геокодер;
     # без ключа геокодера point() возвращает None, и всё работает
     # по-старому — сопоставлением слов.
+    #
+    # Геокодируем только значимое. Обсуждения, назначения и рыночная
+    # статистика адреса не требуют, а их в потоке большинство — на них
+    # суточный предел ушёл бы целиком.
     address = row["address"] if "address" in row.keys() else None
+    if row["kind"] not in db.DEAL_KINDS:
+        address = None
     pt = geo.point(address)
     if pt:
         match = find_by_point(pt)
