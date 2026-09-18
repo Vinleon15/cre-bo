@@ -377,6 +377,12 @@ async def cmd_reparse(msg: types.Message):
     note = await msg.answer(f"Сбросил разбор у {count} материалов. Разбираю заново…")
     parsed, error = await extractor.process_pending(limit=count)
     text = f"Готово. Распознано: {parsed} из {count}."
+    # Разбор мог прерваться — тогда часть материалов осталась со сброшенным
+    # статусом, и сводка будет неполной. Молчать об этом нельзя.
+    left = len(db.pending(count))
+    if left:
+        text += (f"\n\n⚠️ Осталось неразобранных: {left}. "
+                 f"Они подхватятся при следующем обходе или командой /update.")
     if error:
         text += f"\n\n⚠️ {error}"
     await note.edit_text(text)

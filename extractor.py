@@ -7,6 +7,8 @@
 import asyncio
 import json
 import logging
+import os
+import time
 
 import config
 import db
@@ -15,6 +17,27 @@ import offline
 import priority
 
 log = logging.getLogger("extractor")
+
+# Пока идёт разбор, рядом с кодом лежит отметка. Автообновление её видит
+# и откладывает перезапуск: иначе выкатка посреди /reparse обрывала разбор
+# на полпути, а материалы оставались со сброшенным статусом — сводка
+# выглядела опустевшей.
+BUSY_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".busy")
+
+
+def _busy_on() -> None:
+    try:
+        with open(BUSY_FILE, "w") as f:
+            f.write(str(int(time.time())))
+    except OSError:
+        log.warning("Не удалось поставить отметку занятости")
+
+
+def _busy_off() -> None:
+    try:
+        os.remove(BUSY_FILE)
+    except OSError:
+        pass
 
 SYSTEM = """Ты аналитик рынка коммерческой недвижимости. На вход — новость.
 
@@ -150,6 +173,14 @@ async def _extract_gigachat(title, text, category) -> dict | None:
 
 async def process_pending(limit: int = 60) -> tuple[int, str | None]:
     """Разбирает накопившееся. Возвращает (сколько распознано, текст ошибки)."""
+    _busy_on()
+    try:
+        return await _process_pending(limit)
+    finally:
+        _busy_off()
+
+
+async def _process_pending(limit: int = 60) -> tuple[int, str | None]:
     mode = current_mode()
 
     if mode == "free":
