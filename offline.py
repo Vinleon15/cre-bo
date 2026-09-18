@@ -123,6 +123,26 @@ MONEY_RE = re.compile(
 
 AD_MARKERS = ("реклама", "erid", "рекламодатель", "бронирование билетов")
 
+# Вехи девелоперского проекта — узнаются по устойчивым формулировкам
+# в новостях, без разбора подлежащего/сказуемого, в отличие от сделок.
+MILESTONE_PHRASES = {
+    "тэп": ("получил тэп", "получила тэп", "получены тэп", "утверждены тэп",
+            "технико-экономические показатели"),
+    "рнс": ("получил рнс", "получила рнс", "разрешение на строительство"),
+    "рнв": ("получил рнв", "получила рнв", "разрешение на ввод",
+            "ввод в эксплуатацию", "ввели в эксплуатацию", "ввела в эксплуатацию"),
+    "старт продаж": ("старт продаж", "стартовали продажи", "начались продажи",
+                     "открылись продажи", "старт реализации"),
+    "банкротство": ("признан банкротом", "признана банкротом",
+                    "введена процедура банкротства",
+                    "начата процедура банкротства", "банкротство"),
+    "суд": ("подал иск", "подала иск", "арбитражный суд", "судебный спор",
+           "иск о взыскании", "оспорил", "оспорила", "оспаривает"),
+}
+# Суд обычно тянется, а не завершается одномоментно — done=false по умолчанию
+MILESTONE_DONE = {"тэп": True, "рнс": True, "рнв": True,
+                  "старт продаж": True, "банкротство": True, "суд": False}
+
 QUOTES = " \t\u00a0\"'.,:;—–-"
 
 # «у ВТБ», «у семьи Иванова» после глагола покупки — это продавец
@@ -225,6 +245,14 @@ def _amount(text: str) -> str | None:
     return None
 
 
+def _milestone_kind(text: str) -> str | None:
+    low = text.lower()
+    for kind, phrases in MILESTONE_PHRASES.items():
+        if any(p in low for p in phrases):
+            return kind
+    return None
+
+
 def extract(title: str, text: str, category: str | None) -> dict:
     """Возвращает тот же словарь, что и разбор через ИИ."""
     haystack = f"{title}\n{text[:600]}"
@@ -232,6 +260,18 @@ def extract(title: str, text: str, category: str | None) -> dict:
 
     if any(marker in low for marker in AD_MARKERS) and not category:
         return {"relevant": False, "kind": "прочее"}
+
+    milestone = _milestone_kind(haystack)
+    if milestone:
+        return {
+            "relevant": True,
+            "kind": milestone,
+            "done": MILESTONE_DONE[milestone],
+            "object": _tidy(title[:90]),
+            "location": _location(haystack),
+            "amount": _amount(haystack),
+            "area": _area(haystack),
+        }
 
     kind = KIND_BY_CATEGORY.get(category or "", "прочее")
 

@@ -14,6 +14,8 @@ import config
 import db
 import extractor
 import merge
+import objects as objects_mod
+import refs
 import sources
 
 log = logging.getLogger("bot")
@@ -38,7 +40,14 @@ KIND_ICONS = {
     "аренда": "🔑",
     "аукцион": "🔨",
     "инвестиция": "💼",
+    "старт продаж": "🚀",
+    "тэп": "📐",
+    "рнс": "📋",
+    "рнв": "🔓",
+    "банкротство": "⚠️",
+    "суд": "⚖️",
 }
+PRIORITY_ORDER = {"высокий": 0, "средний": 1, "низкий": 2}
 
 
 def _allowed(user_id: int) -> bool:
@@ -75,19 +84,49 @@ def format_deal(card: dict) -> str:
     """Карточка сделки. На вход — объединённая запись из merge.combine."""
     icon = KIND_ICONS.get(card.get("kind") or "", "📌")
     dt = datetime.fromisoformat(card["published"]).strftime("%d.%m")
+    # Высокий приоритет — банкротства, суды, крупные суммы — помечаем явно,
+    # чтобы не листать в поисках главного. Средний и низкий не маркируем,
+    # это база без выделения.
+    mark = "🔴 " if card.get("priority") == "высокий" else ""
 
-    lines = [f"{icon} <b>{esc(card.get('object')) or 'Сделка'}</b>"]
+    lines = [f"{mark}{icon} <b>{esc(card.get('object')) or 'Сделка'}</b>"]
     if card.get("summary"):
         lines.append(f"<i>{esc(card['summary'])}</i>")
     lines.append(f"👤 Покупатель: {esc(card.get('buyer')) or '—'}")
     lines.append(f"🏷 Продавец: {esc(card.get('seller')) or '—'}")
-    lines.append(f"📍 Локация: {esc(card.get('location')) or '—'}")
+    location = esc(card.get("location")) or "—"
+    okrug = card.get("okrug") or refs.okrug_from_text(card.get("location"))
+    if okrug and okrug not in location:
+        location += f" · {okrug}"
+    lines.append(f"📍 Локация: {location}")
+
+    seg_bits = [card.get("segment"), card.get("obj_class")]
+    seg_line = " · ".join(esc(b) for b in seg_bits if b)
+    if seg_line:
+        lines.append(f"🏷 {seg_line}")
     if card.get("amount"):
         lines.append(f"💰 {esc(card['amount'])}")
     if card.get("area"):
         lines.append(f"📐 {esc(card['area'])}")
     if card.get("stage"):
         lines.append(f"📊 {esc(card['stage'])}")
+
+    # Ориентир по рынку — не из новости, а из справочника refs.py.
+    # Подписан явно, чтобы не путать с фактической ценой сделки.
+    hint = refs.price_hint(okrug, card.get("segment"),
+                           card.get("obj_class"), card.get("location"))
+    if hint:
+        lines.append(f"📈 Ориентир рынка: {esc(hint)}")
+
+    # История: если об объекте писали раньше — показываем и даём ссылку
+    oid = card.get("object_id")
+    if oid:
+        obj = db.get_object(oid)
+        if obj and obj["events"] > 1:
+            lines.append(
+                f"📎 {obj['events']}-я новость об объекте · история: "
+                f"/track {oid}"
+            )
 
     sources = card.get("sources") or []
     if len(sources) == 1:
@@ -107,17 +146,29 @@ def build_digest(
     location: str | None = None,
     show_rest: bool = False,
 ) -> list[str]:
-    """Три блока: состоявшиеся сделки, сделки в процессе и (по запросу) прочее."""
+    """Карточки важного, компактные списки мелкого и второстепенного.
+
+    Приоритет «низкий» — та самая мелкая аренда и незначимые сделки,
+    из-за которых дайджест захламлялся. Полной карточки не заслуживает,
+    но и совсем не показываем зря: одна строка в свёрнутом виде.
+    """
     # склейка считается на лету: новая публикация о той же сделке
     # подхватится в объединённую карточку автоматически
-    done = merge.merged(db.deals(days, location))
+    all_done = merge.merged(db.deals(days, location))
+    cards = [c for c in all_done if c.get("priority") != "низкий"]
+    minor = [c for c in all_done if c.get("priority") == "низкий"]
+    cards.sort(key=lambda c: (
+        PRIORITY_ORDER.get(c.get("priority"), 1),
+        -datetime.fromisoformat(c["published"]).timestamp(),
+    ))
+
     pending = db.in_progress(days, location)
     tail = db.rest(days) if show_rest else []
 
-    if not done and not pending and not tail:
+    if not cards and not pending and not tail and not minor:
         return [f"За {label} ничего не найдено."]
 
-    title = f"📊 <b>Дайджест за {label}</b> — сделок: {len(done)}"
+    title = f"📊 <b>Дайджест за {label}</b> — сделок: {len(cards)}"
     if location:
         title += f"\nФильтр по локации: {esc(location)}"
 
@@ -131,7 +182,7 @@ def build_digest(
         else:
             cur += block
 
-    for row in done:
+    for row in cards:
         add("\n\n" + format_deal(row))
 
     if pending:
@@ -140,15 +191,29 @@ def build_digest(
             stage = f" — {esc(row['stage'])}" if row["stage"] else ""
             add(f'\n• <a href="{row["url"]}">{esc(row["title"])[:80]}</a>{stage}')
 
+    if show_rest and minor:
+        add(f"\n\n<b>Мелкие сделки ({len(minor)})</b>")
+        for row in minor:
+            row_sources = row.get("sources") or []
+            url = row_sources[0][0] if row_sources else "#"
+            name = esc(row.get("object")) or "—"
+            add(f'\n• <a href="{url}">{name[:70]}</a>')
+
     if tail:
         add(f"\n\n<b>Остальное ({len(tail)})</b>")
         for row in tail:
             add(f'\n• <a href="{row["url"]}">{esc(row["title"])[:90]}</a>')
-    elif not show_rest:
+
+    if not show_rest:
+        hidden = []
+        if minor:
+            hidden.append(f"мелких сделок: {len(minor)}")
         skipped = len(db.rest(days))
         if skipped:
-            add(f"\n\n<i>Прочих материалов: {skipped}. Показать — /digest "
-                f"{days:g} все</i>")
+            hidden.append(f"прочих материалов: {skipped}")
+        if hidden:
+            add(f"\n\n<i>Скрыто — {', '.join(hidden)}. "
+                f"Показать — /digest {days:g} все</i>")
 
     chunks.append(cur)
     return chunks
@@ -330,6 +395,117 @@ async def cmd_check(msg: types.Message):
     note = await msg.answer("Проверяю связь…")
     result = await asyncio.to_thread(gigachat.check)
     await note.edit_text(result)
+
+
+@dp.message(Command("rebuild"))
+async def cmd_rebuild(msg: types.Message):
+    """Пересобрать историю объектов заново.
+
+    Нужен после смены правил сопоставления: связи считаются один раз
+    при разборе, и старые остаются как были.
+    """
+    if not _is_owner(msg.from_user.id):
+        return await msg.answer("Только для владельца бота.")
+    note = await msg.answer("Пересобираю историю площадок…")
+    db.reset_objects()
+    created, attached = await asyncio.to_thread(objects_mod.process_new, 5000)
+    await note.edit_text(
+        f"Готово. Площадок: {created}, "
+        f"повторных упоминаний: {attached}."
+    )
+
+
+@dp.message(Command("track"))
+async def cmd_track(msg: types.Message):
+    """История новостей по одной площадке."""
+    if not _allowed(msg.from_user.id):
+        return
+    parts = (msg.text or "").split()
+    if len(parts) < 2 or not parts[1].isdigit():
+        return await msg.answer(
+            "Укажи номер объекта: /track 42\n"
+            "Список отслеживаемых площадок: /objects"
+        )
+
+    oid = int(parts[1])
+    obj = db.get_object(oid)
+    if not obj:
+        return await msg.answer("Объект не найден. Список: /objects")
+
+    rows = db.object_timeline(oid)
+    head = [f"📎 <b>{esc(obj['name'])}</b>"]
+
+    facts = []
+    if obj["buyer"]:
+        facts.append(f"👤 Покупатель: {esc(obj['buyer'])}")
+    if obj["seller"]:
+        facts.append(f"🏷 Продавец: {esc(obj['seller'])}")
+    loc = esc(obj["location"]) or ""
+    if obj["okrug"] and obj["okrug"] not in loc:
+        loc = f"{loc} · {obj['okrug']}" if loc else obj["okrug"]
+    if loc:
+        facts.append(f"📍 {loc}")
+    seg = " · ".join(esc(x) for x in (obj["segment"], obj["obj_class"]) if x)
+    if seg:
+        facts.append(f"🏢 {seg}")
+    if obj["amount"]:
+        facts.append(f"💰 {esc(obj['amount'])}")
+    if obj["area"]:
+        facts.append(f"📐 {esc(obj['area'])}")
+    if obj["stage"]:
+        facts.append(f"📊 Сейчас: {esc(obj['stage'])}")
+
+    hint = refs.price_hint(obj["okrug"], obj["segment"],
+                           obj["obj_class"], obj["location"])
+    if hint:
+        facts.append(f"📈 Ориентир рынка: {esc(hint)}")
+
+    text = "\n".join(head + facts)
+    text += f"\n\n<b>История ({len(rows)})</b>"
+
+    chunks = []
+    for row in rows:
+        dt = datetime.fromisoformat(row["published"]).strftime("%d.%m.%y")
+        stage = f" — {esc(row['stage'])}" if row["stage"] else ""
+        line = (f'\n\n{dt} · {esc(row["channel"] if "channel" in row.keys() else row["source"])}'
+                f'\n<a href="{row["url"]}">{esc(row["title"])[:110]}</a>{stage}')
+        if len(text) + len(line) > 3800:
+            chunks.append(text)
+            text = line.strip()
+        else:
+            text += line
+
+    chunks.append(text)
+    for chunk in chunks:
+        await bot.send_message(msg.chat.id, chunk, disable_web_page_preview=True)
+
+
+@dp.message(Command("objects"))
+async def cmd_objects(msg: types.Message):
+    """Площадки, о которых писали чаще всего."""
+    if not _allowed(msg.from_user.id):
+        return
+    parts = (msg.text or "").split()
+    days = 90.0
+    if len(parts) > 1:
+        try:
+            days = float(parts[1])
+        except ValueError:
+            pass
+
+    rows = db.top_objects(days)
+    if not rows:
+        return await msg.answer("Пока ничего не отслеживается.")
+
+    lines = [f"📌 <b>Площадки за {days:g} дн.</b> — {len(rows)}", ""]
+    for obj in rows:
+        last = datetime.fromisoformat(obj["last_seen"]).strftime("%d.%m")
+        mark = f"{obj['events']}×" if obj["events"] > 1 else " ·"
+        where = f" · {obj['okrug']}" if obj["okrug"] else ""
+        lines.append(
+            f"{mark} {esc(obj['name'])[:60]}{where} · {last} — /track {obj['id']}"
+        )
+    await msg.answer("\n".join(lines))
 
 
 @dp.callback_query(F.data.startswith("m:"))

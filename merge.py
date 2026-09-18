@@ -12,7 +12,7 @@
 """
 
 import re
-from datetime import datetime, timedelta
+from datetime import datetime
 
 # Сколько общих слов достаточно, чтобы счесть карточки одной сделкой
 MIN_COMMON = 2
@@ -66,6 +66,23 @@ def _same_deal(a_key: set[str], b_key: set[str]) -> bool:
     return len(a_key & b_key) >= MIN_COMMON
 
 
+def group_by_object(rows: list) -> tuple[list[list], list]:
+    """Сначала группируем по постоянному id объекта.
+
+    Это надёжнее сравнения слов: связь уже установлена при разборе
+    и учитывает всю накопленную историю, а не только текущую выборку.
+    """
+    buckets: dict[int, list] = {}
+    rest: list = []
+    for row in rows:
+        oid = row["object_id"] if "object_id" in row.keys() else None
+        if oid:
+            buckets.setdefault(oid, []).append(row)
+        else:
+            rest.append(row)
+    return list(buckets.values()), rest
+
+
 def group(rows: list) -> list[list]:
     """Разбивает карточки на группы. Связь транзитивна: A~B, B~C → одна группа.
 
@@ -103,6 +120,16 @@ def group(rows: list) -> list[list]:
         key=lambda g: max(_published(r) for r in g),
         reverse=True,
     )
+
+
+_PRIORITY_ORDER = {"высокий": 0, "средний": 1, "низкий": 2}
+
+
+def _max_priority(values: list) -> str | None:
+    """Если хоть один источник расценил как высокий приоритет — оставляем
+    высокий, даже когда другой источник того же события мягче."""
+    valid = [v for v in values if v in _PRIORITY_ORDER]
+    return min(valid, key=lambda v: _PRIORITY_ORDER[v]) if valid else None
 
 
 def _best(values: list[str]) -> str | None:
@@ -152,7 +179,18 @@ def combine(rows: list) -> dict:
     # длинной: источник, заполнивший больше полей, обычно и описал точнее.
     richest = max(rows, key=_completeness)
 
+    keys = rows[0].keys()
+    get = lambda r, f: (r[f] if f in keys else None)
+
     return {
+        "object_id": get(richest, "object_id"),
+        "district": _best([get(r, "district") for r in rows]),
+        "okrug": _best([get(r, "okrug") for r in rows]),
+        "segment": _best([get(r, "segment") for r in rows]),
+        "obj_class": _best([get(r, "obj_class") for r in rows]),
+        "priority": _max_priority([get(r, "priority") for r in rows]),
+        # если хоть один источник счёл событие московским — не прячем
+        "is_moscow": any(bool(get(r, "is_moscow")) for r in rows),
         "object": richest["object"] or _best([r["object"] for r in rows]),
         "buyer": _variants([r["buyer"] for r in rows]),
         "seller": _variants([r["seller"] for r in rows]),
@@ -169,4 +207,8 @@ def combine(rows: list) -> dict:
 
 def merged(rows: list) -> list[dict]:
     """Главная функция: из списка карточек — список объединённых."""
-    return [combine(g) for g in group(rows)]
+    by_object, rest = group_by_object(rows)
+    # у кого объекта ещё нет — досклеиваем по словам, как раньше
+    groups = by_object + group(rest)
+    groups.sort(key=lambda g: max(_published(r) for r in g), reverse=True)
+    return [combine(g) for g in groups]

@@ -6,6 +6,7 @@
 """
 
 import hashlib
+import json
 import re
 import sqlite3
 import threading
@@ -16,8 +17,12 @@ import config
 _lock = threading.Lock()
 _conn: sqlite3.Connection | None = None
 
-# Что считаем сделкой. Остальное (назначения, аналитика, проекты) — в хвост.
-DEAL_KINDS = ("сделка", "аренда", "аукцион", "инвестиция")
+# Что считаем значимым событием для карточек/«в процессе».
+# Остальное (назначения, аналитика) — в хвост «Остальное».
+DEAL_KINDS = (
+    "сделка", "аренда", "аукцион", "инвестиция",
+    "старт продаж", "тэп", "рнс", "рнв", "банкротство", "суд",
+)
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS items (
@@ -41,13 +46,39 @@ CREATE TABLE IF NOT EXISTS items (
     area        TEXT,
     stage       TEXT,
     kind        TEXT,
-    done        INTEGER NOT NULL DEFAULT 0,   -- сделка состоялась, а не в процессе
+    done        INTEGER NOT NULL DEFAULT 0,
+    object_id   INTEGER,
+    district    TEXT,
+    okrug       TEXT,
+    segment     TEXT,
+    obj_class   TEXT,   -- сделка состоялась, а не в процессе
     summary     TEXT,
     UNIQUE(source, ext_id)
 );
 CREATE INDEX IF NOT EXISTS idx_items_pub    ON items(published);
 CREATE INDEX IF NOT EXISTS idx_items_status ON items(status);
 CREATE INDEX IF NOT EXISTS idx_items_thash  ON items(title_hash);
+
+CREATE TABLE IF NOT EXISTS objects (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    name        TEXT NOT NULL,          -- как называем площадку
+    stems       TEXT NOT NULL,          -- ключевые слова, JSON-список
+    first_seen  TEXT NOT NULL,
+    last_seen   TEXT NOT NULL,
+    events      INTEGER NOT NULL DEFAULT 0,
+    -- лучшие известные сведения, накапливаются по мере новостей
+    buyer       TEXT,
+    seller      TEXT,
+    location    TEXT,
+    district    TEXT,
+    okrug       TEXT,
+    segment     TEXT,
+    obj_class   TEXT,
+    amount      TEXT,
+    area        TEXT,
+    stage       TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_obj_last ON objects(last_seen);
 
 CREATE TABLE IF NOT EXISTS settings (
     key   TEXT PRIMARY KEY,
@@ -63,7 +94,12 @@ def init() -> None:
     with _lock:
         _conn.executescript(SCHEMA)
         # база могла быть создана до появления колонки done
-        for col, decl in (("done", "INTEGER NOT NULL DEFAULT 0"), ("area", "TEXT")):
+        for col, decl in (
+            ("done", "INTEGER NOT NULL DEFAULT 0"), ("area", "TEXT"),
+            ("object_id", "INTEGER"), ("district", "TEXT"), ("okrug", "TEXT"),
+            ("segment", "TEXT"), ("obj_class", "TEXT"),
+            ("priority", "TEXT"), ("is_moscow", "INTEGER NOT NULL DEFAULT 1"),
+        ):
             try:
                 _conn.execute(f"ALTER TABLE items ADD COLUMN {col} {decl}")
             except sqlite3.OperationalError:
@@ -137,7 +173,9 @@ def save_extraction(item_id: int, data: dict) -> None:
     with _lock:
         _conn.execute(
             "UPDATE items SET status=?, buyer=?, seller=?, location=?, object=?,"
-            " amount=?, area=?, stage=?, kind=?, done=?, summary=? WHERE id=?",
+            " amount=?, area=?, stage=?, kind=?, done=?, summary=?,"
+            " district=?, okrug=?, segment=?, obj_class=?, priority=?,"
+            " is_moscow=? WHERE id=?",
             (
                 status,
                 data.get("buyer"),
@@ -150,6 +188,12 @@ def save_extraction(item_id: int, data: dict) -> None:
                 data.get("kind"),
                 1 if data.get("done") else 0,
                 data.get("summary"),
+                data.get("district"),
+                data.get("okrug"),
+                data.get("segment"),
+                data.get("obj_class"),
+                data.get("priority"),
+                1 if data.get("is_moscow", True) else 0,
                 item_id,
             ),
         )
@@ -171,10 +215,11 @@ def _placeholders(n: int) -> str:
 
 
 def deals(days: float, location: str | None = None) -> list[sqlite3.Row]:
-    """Состоявшиеся сделки — они и попадают в карточки."""
+    """Состоявшиеся сделки — они и попадают в карточки. Только Москва."""
     sql = (
         "SELECT * FROM items WHERE status='parsed' AND is_dup=0 AND done=1"
-        f" AND kind IN ({_placeholders(len(DEAL_KINDS))}) AND published >= ?"
+        f" AND is_moscow=1 AND kind IN ({_placeholders(len(DEAL_KINDS))})"
+        " AND published >= ?"
     )
     args: list = [*DEAL_KINDS, _since(days)]
     if location:
@@ -186,10 +231,11 @@ def deals(days: float, location: str | None = None) -> list[sqlite3.Row]:
 
 
 def in_progress(days: float, location: str | None = None) -> list[sqlite3.Row]:
-    """Слухи, переговоры, выставленное на продажу — сделка ещё не состоялась."""
+    """Слухи, переговоры, выставленное на продажу. Только Москва."""
     sql = (
         "SELECT * FROM items WHERE status='parsed' AND is_dup=0 AND done=0"
-        f" AND kind IN ({_placeholders(len(DEAL_KINDS))}) AND published >= ?"
+        f" AND is_moscow=1 AND kind IN ({_placeholders(len(DEAL_KINDS))})"
+        " AND published >= ?"
     )
     args: list = [*DEAL_KINDS, _since(days)]
     if location:
@@ -201,10 +247,11 @@ def in_progress(days: float, location: str | None = None) -> list[sqlite3.Row]:
 
 
 def rest(days: float) -> list[sqlite3.Row]:
-    """Всё несделочное: аналитика, назначения, проекты. Только по запросу."""
+    """Несделочное (аналитика, назначения) ИЛИ не про Москву. По запросу."""
     sql = (
         "SELECT * FROM items WHERE status='parsed' AND is_dup=0"
-        f" AND (kind IS NULL OR kind NOT IN ({_placeholders(len(DEAL_KINDS))}))"
+        f" AND (kind IS NULL OR kind NOT IN ({_placeholders(len(DEAL_KINDS))})"
+        " OR is_moscow=0)"
         " AND published >= ? ORDER BY published DESC"
     )
     with _lock:
@@ -283,3 +330,112 @@ def reset_parsed() -> int:
         )
         _conn.commit()
     return cur.rowcount
+
+
+# --- объекты (площадки): накопление истории ------------------------------
+
+def all_objects() -> list[sqlite3.Row]:
+    with _lock:
+        return _conn.execute("SELECT * FROM objects").fetchall()
+
+
+def get_object(object_id: int) -> sqlite3.Row | None:
+    with _lock:
+        return _conn.execute(
+            "SELECT * FROM objects WHERE id = ?", (object_id,)
+        ).fetchone()
+
+
+def create_object(name: str, stems: list[str], published: str,
+                  fields: dict) -> int:
+    with _lock:
+        cur = _conn.execute(
+            "INSERT INTO objects(name, stems, first_seen, last_seen, events,"
+            " buyer, seller, location, district, okrug, segment, obj_class,"
+            " amount, area, stage)"
+            " VALUES(?,?,?,?,1,?,?,?,?,?,?,?,?,?,?)",
+            (name, json.dumps(sorted(stems), ensure_ascii=False),
+             published, published,
+             fields.get("buyer"), fields.get("seller"), fields.get("location"),
+             fields.get("district"), fields.get("okrug"), fields.get("segment"),
+             fields.get("obj_class"), fields.get("amount"), fields.get("area"),
+             fields.get("stage")),
+        )
+        _conn.commit()
+    return cur.lastrowid
+
+
+def update_object(object_id: int, stems: list[str], published: str,
+                  fields: dict) -> None:
+    """Дополняет объект: пустые поля заполняются, известные не затираются."""
+    with _lock:
+        row = _conn.execute(
+            "SELECT * FROM objects WHERE id = ?", (object_id,)
+        ).fetchone()
+        if row is None:
+            return
+
+        merged = sorted(set(json.loads(row["stems"])) | set(stems))
+        # Свежие сведения важнее: stage перезаписываем всегда, остальное —
+        # только если раньше было пусто.
+        vals = {}
+        for f in ("buyer", "seller", "location", "district", "okrug",
+                  "segment", "obj_class", "amount", "area"):
+            vals[f] = row[f] or fields.get(f)
+        vals["stage"] = fields.get("stage") or row["stage"]
+
+        _conn.execute(
+            "UPDATE objects SET stems=?, last_seen=?, events=events+1,"
+            " buyer=?, seller=?, location=?, district=?, okrug=?, segment=?,"
+            " obj_class=?, amount=?, area=?, stage=? WHERE id=?",
+            (json.dumps(merged, ensure_ascii=False),
+             max(row["last_seen"], published),
+             vals["buyer"], vals["seller"], vals["location"], vals["district"],
+             vals["okrug"], vals["segment"], vals["obj_class"], vals["amount"],
+             vals["area"], vals["stage"], object_id),
+        )
+        _conn.commit()
+
+
+def link_item(item_id: int, object_id: int) -> None:
+    with _lock:
+        _conn.execute("UPDATE items SET object_id=? WHERE id=?",
+                      (object_id, item_id))
+        _conn.commit()
+
+
+def object_timeline(object_id: int) -> list[sqlite3.Row]:
+    """Все материалы об объекте, от старых к новым."""
+    with _lock:
+        return _conn.execute(
+            "SELECT * FROM items WHERE object_id = ? AND is_dup = 0"
+            " ORDER BY published",
+            (object_id,),
+        ).fetchall()
+
+
+def unlinked_parsed(limit: int = 500) -> list[sqlite3.Row]:
+    """Разобранные материалы, ещё не привязанные к объекту."""
+    with _lock:
+        return _conn.execute(
+            "SELECT * FROM items WHERE status='parsed' AND object_id IS NULL"
+            " ORDER BY published LIMIT ?", (limit,)
+        ).fetchall()
+
+
+def top_objects(days: float = 90, limit: int = 20) -> list[sqlite3.Row]:
+    """Объекты с наибольшим числом новостей за период."""
+    with _lock:
+        return _conn.execute(
+            "SELECT * FROM objects WHERE last_seen >= ?"
+            " ORDER BY events DESC, last_seen DESC LIMIT ?",
+            (_since(days), limit),
+        ).fetchall()
+
+
+def reset_objects() -> None:
+    """Сброс накопленной истории — для пересборки после смены правил."""
+    with _lock:
+        _conn.execute("DELETE FROM objects")
+        _conn.execute("UPDATE items SET object_id = NULL")
+        _conn.commit()
