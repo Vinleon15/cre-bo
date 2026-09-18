@@ -22,6 +22,15 @@ import refs
 # много объектов, и случайных пересечений становится больше.
 MIN_COMMON = 3
 
+# Сколько примет должно совпасть с ОПОРНЫМИ — именем площадки и адресом.
+# Без этого условия объект превращался в магнит: приметы копились
+# объединением при каждой новости, за сорок публикаций их набиралось
+# столько, что подходило почти всё. Так банкротство совладельца
+# «Большевика» слиплось с проектом на Варшавском шоссе. Опорные приметы
+# задаются при создании объекта и больше не растут, поэтому площадка
+# остаётся собой, сколько бы новостей о ней ни вышло.
+MIN_CORE = 2
+
 STEM_LEN = 6
 
 # Частые слова, по которым склеилось бы всё подряд
@@ -60,6 +69,15 @@ def item_stems(row) -> set[str]:
                  row["location"], row["area"])
 
 
+def item_core(row) -> set[str]:
+    """Опорные приметы: как площадка называется и где стоит.
+
+    Покупатель, продавец и площадь сюда не входят — они меняются от
+    сделки к сделке, а имя и адрес у площадки одни.
+    """
+    return stems(row["object"], row["location"], row["district"])
+
+
 def item_fields(row) -> dict:
     district = row["district"]
     okrug = row["okrug"] or refs.okrug_by_district(district) \
@@ -72,13 +90,28 @@ def item_fields(row) -> dict:
     }
 
 
-def find_match(key: set[str], objects: list) -> int | None:
-    """Ищем объект с наибольшим пересечением, но не ниже порога."""
+def _load(obj, field: str) -> set[str]:
+    try:
+        return set(json.loads(obj[field] or "[]"))
+    except (ValueError, TypeError, IndexError, KeyError):
+        return set()
+
+
+def find_match(key: set[str], core: set[str], objects: list) -> int | None:
+    """Ищем объект с наибольшим пересечением, но не ниже обоих порогов.
+
+    Должно совпасть и достаточно примет вообще, и достаточно опорных —
+    имени площадки или адреса. Совпадения по одним лишь сопутствующим
+    словам (сумма, участники, сегмент) объектом не считаются.
+    """
     best_id, best_score = None, 0
     for obj in objects:
-        try:
-            obj_key = set(json.loads(obj["stems"]))
-        except (ValueError, TypeError):
+        obj_key = _load(obj, "stems")
+        if not obj_key:
+            continue
+        obj_core = _load(obj, "core") or obj_key
+
+        if len(core & obj_core) < MIN_CORE:
             continue
         score = len(key & obj_key)
         if score >= MIN_COMMON and score > best_score:
@@ -89,16 +122,17 @@ def find_match(key: set[str], objects: list) -> int | None:
 def attach(row) -> tuple[int, bool]:
     """Привязывает материал к объекту. Возвращает (id объекта, новый ли)."""
     key = item_stems(row)
-    if len(key) < MIN_COMMON:
+    core = item_core(row)
+    if len(key) < MIN_COMMON or len(core) < MIN_CORE:
         # слишком мало примет — отдельный объект без шанса на склейку
         object_id = db.create_object(
             row["object"] or row["title"][:80], key,
-            row["published"], item_fields(row))
+            row["published"], item_fields(row), core)
         db.link_item(row["id"], object_id)
         return object_id, True
 
     objects = db.all_objects()
-    match = find_match(key, objects)
+    match = find_match(key, core, objects)
 
     if match:
         db.update_object(match, key, row["published"], item_fields(row))
@@ -107,7 +141,7 @@ def attach(row) -> tuple[int, bool]:
 
     object_id = db.create_object(
         row["object"] or row["title"][:80], key,
-        row["published"], item_fields(row))
+        row["published"], item_fields(row), core)
     db.link_item(row["id"], object_id)
     return object_id, True
 

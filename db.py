@@ -63,6 +63,8 @@ CREATE TABLE IF NOT EXISTS objects (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     name        TEXT NOT NULL,          -- как называем площадку
     stems       TEXT NOT NULL,          -- ключевые слова, JSON-список
+    core        TEXT,                   -- опорные приметы: имя и адрес,
+                                        -- не растут со временем
     first_seen  TEXT NOT NULL,
     last_seen   TEXT NOT NULL,
     events      INTEGER NOT NULL DEFAULT 0,
@@ -94,6 +96,11 @@ def init() -> None:
     with _lock:
         _conn.executescript(SCHEMA)
         # база могла быть создана до появления колонки done
+        try:
+            _conn.execute("ALTER TABLE objects ADD COLUMN core TEXT")
+        except sqlite3.OperationalError:
+            pass  # колонка уже есть
+
         for col, decl in (
             ("done", "INTEGER NOT NULL DEFAULT 0"), ("area", "TEXT"),
             ("object_id", "INTEGER"), ("district", "TEXT"), ("okrug", "TEXT"),
@@ -347,14 +354,15 @@ def get_object(object_id: int) -> sqlite3.Row | None:
 
 
 def create_object(name: str, stems: list[str], published: str,
-                  fields: dict) -> int:
+                  fields: dict, core: list[str] | None = None) -> int:
     with _lock:
         cur = _conn.execute(
-            "INSERT INTO objects(name, stems, first_seen, last_seen, events,"
-            " buyer, seller, location, district, okrug, segment, obj_class,"
-            " amount, area, stage)"
-            " VALUES(?,?,?,?,1,?,?,?,?,?,?,?,?,?,?)",
+            "INSERT INTO objects(name, stems, core, first_seen, last_seen,"
+            " events, buyer, seller, location, district, okrug, segment,"
+            " obj_class, amount, area, stage)"
+            " VALUES(?,?,?,?,?,1,?,?,?,?,?,?,?,?,?,?)",
             (name, json.dumps(sorted(stems), ensure_ascii=False),
+             json.dumps(sorted(core or stems), ensure_ascii=False),
              published, published,
              fields.get("buyer"), fields.get("seller"), fields.get("location"),
              fields.get("district"), fields.get("okrug"), fields.get("segment"),

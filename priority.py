@@ -48,8 +48,17 @@ MILESTONE_KINDS = {"тэп", "рнс", "рнв", "старт продаж"}
 # в потоке систематически много сделок выше/ниже привычного диапазона.
 LARGE_AMOUNT = 3_000_000_000     # 3 млрд руб — высокий приоритет
 MEDIUM_AMOUNT = 500_000_000      # 500 млн руб — средний
-LARGE_AREA = 10_000              # 10 тыс кв м (или от 1 га) — высокий
-MEDIUM_AREA = 1_000              # меньше — типичная мелкая аренда
+
+# Пороги по застроенной площади. Десять тысяч метров оказались слишком
+# низкой планкой: под неё попадала обычная офисная аренда, и красной
+# меткой помечалось больше половины сводки — метка перестаёт выделять.
+LARGE_AREA = 20_000
+MEDIUM_AREA = 1_000
+
+# Земля считается отдельно: два гектара участка и двадцать тысяч метров
+# здания — события разного веса, а в квадратных метрах они сравнялись бы.
+LARGE_LAND_HA = 5
+MEDIUM_LAND_HA = 1
 
 _AMOUNT_RE = re.compile(
     r"(\d[\d\s]*[.,]?\d*)\s*(млрд|млн|тыс)?", re.IGNORECASE
@@ -73,21 +82,21 @@ def _to_rub(amount: str | None) -> float | None:
     return num * mult
 
 
-def _to_sqm(area: str | None) -> float | None:
+def _to_area(area: str | None) -> tuple[float | None, bool]:
+    """Возвращает (величина, это ли гектары). Землю не переводим в метры:
+    её вес оценивается своими порогами."""
     if not area:
-        return None
+        return None, False
     m = _AREA_RE.search(area)
     if not m:
-        return None
+        return None, False
     try:
         num = float(m.group(1).replace(" ", "").replace(",", "."))
     except ValueError:
-        return None
+        return None, False
     if m.group(2):  # «тыс.»
         num *= 1000
-    if "га" in m.group(3).lower():
-        num *= 10_000  # 1 га = 10 000 кв м
-    return num
+    return num, "га" in m.group(3).lower()
 
 
 def score(kind: str | None, amount: str | None, area: str | None) -> str:
@@ -98,7 +107,7 @@ def score(kind: str | None, amount: str | None, area: str | None) -> str:
         return "высокий"
 
     rub = _to_rub(amount)
-    sqm = _to_sqm(area)
+    size, in_hectares = _to_area(area)
 
     if rub is not None:
         if rub >= LARGE_AMOUNT:
@@ -106,10 +115,12 @@ def score(kind: str | None, amount: str | None, area: str | None) -> str:
         if rub >= MEDIUM_AMOUNT:
             return "средний"
 
-    if sqm is not None:
-        if sqm >= LARGE_AREA:
+    if size is not None:
+        big, medium = (LARGE_LAND_HA, MEDIUM_LAND_HA) if in_hectares \
+            else (LARGE_AREA, MEDIUM_AREA)
+        if size >= big:
             return "высокий"
-        if sqm >= MEDIUM_AREA:
+        if size >= medium:
             return "средний"
         if rub is None:
             # площадь маленькая, денег нет — типичная мелкая аренда офиса
@@ -118,7 +129,7 @@ def score(kind: str | None, amount: str | None, area: str | None) -> str:
     if k in MILESTONE_KINDS:
         return "средний"
 
-    if rub is None and sqm is None:
+    if rub is None and size is None:
         # размер сделки неизвестен — не занижаем на всякий случай:
         # часто крупные сделки не раскрывают сумму именно потому,
         # что она большая
