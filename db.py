@@ -66,6 +66,9 @@ CREATE TABLE IF NOT EXISTS objects (
     stems       TEXT NOT NULL,          -- ключевые слова, JSON-список
     core        TEXT,                   -- опорные приметы: имя и адрес,
                                         -- не растут со временем
+    address     TEXT,                   -- адрес, приведённый моделью
+    lat         REAL,                   -- координаты площадки: место у неё
+    lon         REAL,                   -- одно, как бы её ни называли
     first_seen  TEXT NOT NULL,
     last_seen   TEXT NOT NULL,
     events      INTEGER NOT NULL DEFAULT 0,
@@ -83,6 +86,14 @@ CREATE TABLE IF NOT EXISTS objects (
 );
 CREATE INDEX IF NOT EXISTS idx_obj_last ON objects(last_seen);
 
+CREATE TABLE IF NOT EXISTS geocache (
+    address    TEXT PRIMARY KEY,        -- запрос как есть
+    lat        REAL,
+    lon        REAL,
+    precision  TEXT,                    -- точность ответа геокодера
+    asked_at   TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS settings (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
@@ -97,16 +108,19 @@ def init() -> None:
     with _lock:
         _conn.executescript(SCHEMA)
         # база могла быть создана до появления колонки done
-        try:
-            _conn.execute("ALTER TABLE objects ADD COLUMN core TEXT")
-        except sqlite3.OperationalError:
-            pass  # колонка уже есть
+        for col, decl in (("core", "TEXT"), ("address", "TEXT"),
+                          ("lat", "REAL"), ("lon", "REAL")):
+            try:
+                _conn.execute(f"ALTER TABLE objects ADD COLUMN {col} {decl}")
+            except sqlite3.OperationalError:
+                pass  # колонка уже есть
 
         for col, decl in (
             ("done", "INTEGER NOT NULL DEFAULT 0"), ("area", "TEXT"),
             ("object_id", "INTEGER"), ("district", "TEXT"), ("okrug", "TEXT"),
             ("segment", "TEXT"), ("obj_class", "TEXT"),
             ("priority", "TEXT"), ("is_moscow", "INTEGER NOT NULL DEFAULT 1"),
+            ("address", "TEXT"),
         ):
             try:
                 _conn.execute(f"ALTER TABLE items ADD COLUMN {col} {decl}")
@@ -183,7 +197,7 @@ def save_extraction(item_id: int, data: dict) -> None:
             "UPDATE items SET status=?, buyer=?, seller=?, location=?, object=?,"
             " amount=?, area=?, stage=?, kind=?, done=?, summary=?,"
             " district=?, okrug=?, segment=?, obj_class=?, priority=?,"
-            " is_moscow=? WHERE id=?",
+            " is_moscow=?, address=? WHERE id=?",
             (
                 status,
                 data.get("buyer"),
@@ -202,6 +216,7 @@ def save_extraction(item_id: int, data: dict) -> None:
                 data.get("obj_class"),
                 data.get("priority"),
                 1 if data.get("is_moscow", True) else 0,
+                data.get("address"),
                 item_id,
             ),
         )
@@ -448,3 +463,99 @@ def reset_objects() -> None:
         _conn.execute("DELETE FROM objects")
         _conn.execute("UPDATE items SET object_id = NULL")
         _conn.commit()
+
+
+# ------------------------------------------------------------ геокодер
+
+def geocache_get(address: str):
+    """Ответ геокодера из кэша или None, если адрес ещё не спрашивали."""
+    with _lock:
+        return _conn.execute(
+            "SELECT lat, lon, precision FROM geocache WHERE address = ?",
+            (address,),
+        ).fetchone()
+
+
+def geocache_put(address: str, lat: float | None, lon: float | None,
+                 precision: str | None) -> None:
+    """Запоминаем ответ, в том числе пустой: не найденный адрес не стоит
+    спрашивать снова при каждом разборе."""
+    with _lock:
+        _conn.execute(
+            "INSERT OR REPLACE INTO geocache(address, lat, lon, precision,"
+            " asked_at) VALUES(?,?,?,?,?)",
+            (address, lat, lon, precision,
+             datetime.now(timezone.utc).isoformat()),
+        )
+        _conn.commit()
+
+
+def objects_with_coords() -> list[sqlite3.Row]:
+    with _lock:
+        return _conn.execute(
+            "SELECT * FROM objects WHERE lat IS NOT NULL"
+        ).fetchall()
+
+
+def set_object_point(object_id: int, address: str | None,
+                     lat: float, lon: float) -> None:
+    with _lock:
+        _conn.execute(
+            "UPDATE objects SET address=COALESCE(address, ?), lat=?, lon=?"
+            " WHERE id=?",
+            (address, lat, lon, object_id),
+        )
+        _conn.commit()
+
+
+def merge_objects(keep_id: int, drop_id: int) -> int:
+    """Считать две площадки одной. Материалы переезжают, вторая удаляется.
+
+    Нужна потому, что ошибается и модель, и геокодер, а без правки ошибка
+    навсегда портит историю площадки.
+    """
+    if keep_id == drop_id:
+        return 0
+    with _lock:
+        moved = _conn.execute(
+            "UPDATE items SET object_id=? WHERE object_id=?",
+            (keep_id, drop_id),
+        ).rowcount
+        row = _conn.execute(
+            "SELECT stems, core, events FROM objects WHERE id=?", (drop_id,)
+        ).fetchone()
+        keep = _conn.execute(
+            "SELECT stems, core, events FROM objects WHERE id=?", (keep_id,)
+        ).fetchone()
+        if row and keep:
+            stems = sorted(set(json.loads(keep["stems"]))
+                           | set(json.loads(row["stems"])))
+            core = sorted(set(json.loads(keep["core"] or "[]"))
+                          | set(json.loads(row["core"] or "[]")))
+            _conn.execute(
+                "UPDATE objects SET stems=?, core=?, events=? WHERE id=?",
+                (json.dumps(stems, ensure_ascii=False),
+                 json.dumps(core, ensure_ascii=False),
+                 keep["events"] + row["events"], keep_id),
+            )
+        _conn.execute("DELETE FROM objects WHERE id=?", (drop_id,))
+        _conn.commit()
+    return moved
+
+
+def detach_last(object_id: int) -> str | None:
+    """Отвязать от площадки самый свежий материал. Возвращает заголовок."""
+    with _lock:
+        row = _conn.execute(
+            "SELECT id, title FROM items WHERE object_id=?"
+            " ORDER BY published DESC LIMIT 1", (object_id,)
+        ).fetchone()
+        if row is None:
+            return None
+        _conn.execute("UPDATE items SET object_id=NULL WHERE id=?",
+                      (row["id"],))
+        _conn.execute(
+            "UPDATE objects SET events=MAX(events-1, 0) WHERE id=?",
+            (object_id,))
+        _conn.commit()
+    return row["title"]

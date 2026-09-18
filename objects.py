@@ -15,7 +15,9 @@
 import json
 import re
 
+import config
 import db
+import geo
 import refs
 
 # Порог совпадения слов. Выше, чем в merge.py: за месяцы накапливается
@@ -44,6 +46,10 @@ STOP = {
     "сделки", "продаж", "покупк", "аренда", "аренды", "рынка", "рынке",
     # Общие слова адреса. Без них «Дмитровское шоссе» и «Каширское шоссе»
     # роднятся по слову «шоссе», и две разные сделки сходятся в одну.
+    # Предлоги и общие слова о месте: «участок в центре города» давал
+    # приметы «центре» и «города», и два разных участка слипались.
+    "между", "рядом", "напрот", "около", "возле", "центре", "центра",
+    "города", "городе", "района", "районе", "участо", "площад",
     "шоссе", "улица", "улице", "улицы", "проспе", "переул", "набере",
     "бульва", "район", "округ", "город", "корпус", "строен", "владен",
     "руб", "доллар", "евро",
@@ -124,10 +130,44 @@ def find_match(key: set[str], core: set[str], objects: list) -> int | None:
     return best_id
 
 
+def find_by_point(pt: tuple[float, float]) -> int | None:
+    """Ближайшая площадка в пределах радиуса.
+
+    Главный способ узнать площадку. Как бы её ни назвали — «около
+    гостиницы Украина», «Кутузовский, 2/1», «Украина-плаза» — место одно,
+    и точка на карте у всех трёх формулировок одна.
+    """
+    best_id, best_dist = None, config.GEO_RADIUS_M
+    for obj in db.objects_with_coords():
+        dist = geo.distance_m(pt, (obj["lat"], obj["lon"]))
+        if dist <= best_dist:
+            best_id, best_dist = obj["id"], dist
+    return best_id
+
+
 def attach(row) -> tuple[int, bool]:
     """Привязывает материал к объекту. Возвращает (id объекта, новый ли)."""
     key = item_stems(row)
     core = item_core(row)
+
+    # Сначала карта. Адрес приводит модель, координаты даёт геокодер;
+    # без ключа геокодера point() возвращает None, и всё работает
+    # по-старому — сопоставлением слов.
+    address = row["address"] if "address" in row.keys() else None
+    pt = geo.point(address)
+    if pt:
+        match = find_by_point(pt)
+        if match:
+            db.update_object(match, key, row["published"], item_fields(row))
+            db.link_item(row["id"], match)
+            return match, False
+
+        object_id = db.create_object(
+            row["object"] or row["title"][:80], key,
+            row["published"], item_fields(row), core)
+        db.set_object_point(object_id, address, *pt)
+        db.link_item(row["id"], object_id)
+        return object_id, True
     if len(key) < MIN_COMMON or len(core) < MIN_CORE:
         # слишком мало примет — отдельный объект без шанса на склейку
         object_id = db.create_object(

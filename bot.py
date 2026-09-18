@@ -467,6 +467,47 @@ async def cmd_rebuild(msg: types.Message):
     )
 
 
+@dp.message(Command("merge"))
+async def cmd_merge(msg: types.Message):
+    """Считать две площадки одной — когда бот их не узнал."""
+    if not _is_owner(msg.from_user.id):
+        return await msg.answer("Эта команда доступна только владельцу бота.")
+    parts = (msg.text or "").split()
+    nums = [p for p in parts[1:] if p.isdigit()]
+    if len(nums) != 2:
+        return await msg.answer(
+            "Нужны два номера площадок: <code>/merge 12 34</code>\n"
+            "Материалы второй переедут к первой. Номера видно в карточке "
+            "рядом с /track."
+        )
+    keep, drop = int(nums[0]), int(nums[1])
+    if not db.get_object(keep) or not db.get_object(drop):
+        return await msg.answer("Не нашёл такую площадку. Список: /objects")
+    moved = db.merge_objects(keep, drop)
+    await msg.answer(
+        f"Готово. Площадка {drop} слита с {keep}, переехало материалов: "
+        f"{moved}.\nИстория: /track {keep}"
+    )
+
+
+@dp.message(Command("split"))
+async def cmd_split(msg: types.Message):
+    """Отвязать от площадки последний материал — когда склеилось лишнее."""
+    if not _is_owner(msg.from_user.id):
+        return await msg.answer("Эта команда доступна только владельцу бота.")
+    parts = (msg.text or "").split()
+    nums = [p for p in parts[1:] if p.isdigit()]
+    if len(nums) != 1:
+        return await msg.answer(
+            "Нужен номер площадки: <code>/split 12</code>\n"
+            "Отвяжу самый свежий материал."
+        )
+    title = db.detach_last(int(nums[0]))
+    if title is None:
+        return await msg.answer("У этой площадки нет привязанных материалов.")
+    await msg.answer(f"Отвязал: {esc(title[:90])}")
+
+
 @dp.message(Command("track"))
 async def cmd_track(msg: types.Message):
     """История новостей по одной площадке."""
